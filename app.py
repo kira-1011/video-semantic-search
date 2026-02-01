@@ -436,52 +436,53 @@ def perform_search(query: str, siglip_model, siglip_processor, device, top_k: in
     # Count results for tab labels
     video_count = len(video_results)
     image_count = len(image_results)
-    doc_count = len(doc_results)
-    total_count = video_count + image_count + doc_count
+    # Count unique documents, not chunks
+    unique_docs = len(set(r["doc_id"] for r in doc_results)) if doc_results else 0
+    total_count = video_count + image_count + unique_docs
     
     # Create tabs with result counts
     tab_all, tab_videos, tab_images, tab_docs = st.tabs([
         f"All ({total_count})",
         f"Videos ({video_count})",
         f"Images ({image_count})",
-        f"Documents ({doc_count})"
+        f"Documents ({unique_docs})"
     ])
     
     # All tab - combined view
     with tab_all:
         if video_results:
             st.subheader(f"🎬 Videos ({video_count})")
-            display_video_results(video_results)
+            display_video_results(video_results, key_prefix="all_")
         if image_results:
             st.subheader(f"🖼️ Images ({image_count})")
-            display_image_results(image_results)
+            display_image_results(image_results, key_prefix="all_")
         if doc_results:
-            st.subheader(f"📄 Documents ({doc_count})")
-            display_document_results(doc_results)
+            st.subheader(f"📄 Documents ({unique_docs})")
+            display_document_results(doc_results, key_prefix="all_")
     
     # Videos tab
     with tab_videos:
         if video_results:
-            display_video_results(video_results)
+            display_video_results(video_results, key_prefix="tab_")
         else:
             st.info("No video results found.")
     
     # Images tab
     with tab_images:
         if image_results:
-            display_image_results(image_results)
+            display_image_results(image_results, key_prefix="tab_")
         else:
             st.info("No image results found.")
     
     # Documents tab
     with tab_docs:
         if doc_results:
-            display_document_results(doc_results)
+            display_document_results(doc_results, key_prefix="tab_")
         else:
             st.info("No document results found.")
 
 
-def display_video_results(results):
+def display_video_results(results, key_prefix: str = ""):
     """Display video search results in a grid."""
     cols_per_row = 5
     
@@ -504,7 +505,7 @@ def display_video_results(results):
                 st.caption(f"Score: {result['score']:.1%}")
                 st.caption(f"Video: {result.get('video_id', result['source_id'])}")
                 
-                if st.button("▶ Play", key=f"play_video_{result_idx}", width="stretch"):
+                if st.button("▶ Play", key=f"{key_prefix}play_video_{result_idx}", width="stretch"):
                     st.session_state.selected_result = result
     
     # Video player for selected result
@@ -521,7 +522,7 @@ def display_video_results(results):
                 st.error(f"Video file not found: {video_path}")
 
 
-def display_image_results(results):
+def display_image_results(results, key_prefix: str = ""):
     """Display image search results in a grid."""
     cols_per_row = 5
     
@@ -547,29 +548,63 @@ def display_image_results(results):
                 st.caption(f"{result['source_id']}")
 
 
-def display_document_results(results):
-    """Display document search results as cards."""
+def display_document_results(results, key_prefix: str = ""):
+    """Display document search results grouped by document."""
+    if not results:
+        return
+    
+    # Group results by document
+    from collections import defaultdict
+    docs = defaultdict(list)
     for result in results:
+        docs[result["doc_id"]].append(result)
+    
+    # Sort documents by best chunk score
+    sorted_docs = sorted(docs.items(), key=lambda x: max(c["score"] for c in x[1]), reverse=True)
+    
+    for doc_id, chunks in sorted_docs:
+        # Sort chunks by score within document
+        chunks = sorted(chunks, key=lambda x: x["score"], reverse=True)
+        best_chunk = chunks[0]
+        file_type = best_chunk.get("file_type", "").upper()
+        best_score = best_chunk["score"]
+        match_count = len(chunks)
+        
         with st.container():
+            # Document header
             col1, col2 = st.columns([4, 1])
             
             with col1:
-                # Document header
-                doc_name = result["doc_id"]
-                file_type = result.get("file_type", "").upper()
-                page_info = f" (Page {result['page']})" if result.get("page") else ""
-                chunk_info = f"Chunk {result['chunk_idx'] + 1}"
-                
-                st.markdown(f"**{doc_name}** `{file_type}` {page_info} - {chunk_info}")
-                
-                # Text preview
-                text_preview = result.get("text", "")[:300]
-                if len(result.get("text", "")) > 300:
-                    text_preview += "..."
-                st.text(text_preview)
+                match_label = f"{match_count} match" if match_count == 1 else f"{match_count} matches"
+                st.markdown(f"### 📄 {doc_id} `{file_type}`")
+                st.caption(f"{match_label} found")
             
             with col2:
-                st.metric("Score", f"{result['score']:.1%}")
+                st.metric("Best", f"{best_score:.1%}")
+            
+            # Show best match directly
+            best_page = f"Page {best_chunk['page']}" if best_chunk.get("page") else ""
+            best_text = best_chunk.get("text", "")[:400]
+            if len(best_chunk.get("text", "")) > 400:
+                best_text += "..."
+            
+            st.markdown(f"**Best match:** {best_page}")
+            st.text(best_text)
+            
+            # Show other matches in expander if multiple
+            if match_count > 1:
+                with st.expander(f"Show {match_count - 1} more match{'es' if match_count > 2 else ''}"):
+                    for chunk in chunks[1:]:
+                        page_info = f"Page {chunk['page']}" if chunk.get("page") else ""
+                        chunk_info = f"Chunk {chunk['chunk_idx'] + 1}"
+                        score = chunk["score"]
+                        
+                        st.markdown(f"**{page_info} - {chunk_info}** (Score: {score:.1%})")
+                        text_preview = chunk.get("text", "")[:250]
+                        if len(chunk.get("text", "")) > 250:
+                            text_preview += "..."
+                        st.text(text_preview)
+                        st.markdown("---")
             
             st.markdown("---")
 
