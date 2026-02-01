@@ -27,10 +27,14 @@ DEFAULT_TOP_K = 10
 
 DATA_DIR = Path("./data")
 VIDEOS_DIR = DATA_DIR / "videos"
+IMAGES_DIR = DATA_DIR / "images"
+DOCUMENTS_DIR = DATA_DIR / "documents"
 DB_DIR = DATA_DIR / "chroma_db"
 
 # Ensure directories exist
 VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
 DB_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -72,7 +76,7 @@ def load_model():
 # =============================================================================
 
 _chroma_client = None
-_collection = None
+_visual_collection = None
 
 
 def get_chroma_client():
@@ -83,56 +87,92 @@ def get_chroma_client():
     return _chroma_client
 
 
-def get_collection():
-    """Get or create the video frames collection."""
-    global _collection
-    if _collection is None:
+def get_visual_collection():
+    """Get or create the visual content collection (videos + images)."""
+    global _visual_collection
+    if _visual_collection is None:
         client = get_chroma_client()
-        _collection = client.get_or_create_collection(
-            name="video_frames",
+        _visual_collection = client.get_or_create_collection(
+            name="visual_content",
             metadata={"hnsw:space": "cosine"}
         )
-    return _collection
+    return _visual_collection
 
 
-def get_database_stats():
+# Legacy alias for backward compatibility
+def get_collection():
+    """Legacy alias for get_visual_collection()."""
+    return get_visual_collection()
+
+
+def get_visual_stats():
     """
-    Get statistics about the indexed database.
+    Get statistics about the indexed visual content.
     
     Returns:
-        dict: Statistics including total frames and video list
+        dict: Statistics including frames, videos, and images
     """
-    collection = get_collection()
-    total_frames = collection.count()
+    collection = get_visual_collection()
+    total_items = collection.count()
     
     stats = {
-        "total_frames": total_frames,
+        "total_items": total_items,
+        "total_frames": 0,
+        "total_images": 0,
         "videos": [],
-        "video_count": 0
+        "images": [],
+        "video_count": 0,
+        "image_count": 0
     }
     
-    if total_frames > 0:
+    if total_items > 0:
         all_data = collection.get(include=["metadatas"])
-        video_ids = set(m.get("video_id", "unknown") for m in all_data["metadatas"])
-        stats["videos"] = list(video_ids)
-        stats["video_count"] = len(video_ids)
+        
+        for m in all_data["metadatas"]:
+            item_type = m.get("type", "video")  # Default to video for legacy data
+            
+            if item_type == "video":
+                video_id = m.get("video_id") or m.get("source_id", "unknown")
+                if video_id not in stats["videos"]:
+                    stats["videos"].append(video_id)
+                stats["total_frames"] += 1
+            elif item_type == "image":
+                image_id = m.get("source_id", "unknown")
+                if image_id not in stats["images"]:
+                    stats["images"].append(image_id)
+                stats["total_images"] += 1
+        
+        stats["video_count"] = len(stats["videos"])
+        stats["image_count"] = len(stats["images"])
     
     return stats
 
 
-def clear_database():
-    """Clear all data from the collection."""
-    global _collection
+# Legacy alias
+def get_database_stats():
+    """Legacy alias for get_visual_stats()."""
+    return get_visual_stats()
+
+
+def clear_visual_database():
+    """Clear all data from the visual content collection."""
+    global _visual_collection
     client = get_chroma_client()
     try:
-        client.delete_collection("video_frames")
+        client.delete_collection("visual_content")
     except Exception:
         pass
-    _collection = client.create_collection(
-        name="video_frames",
+    _visual_collection = client.create_collection(
+        name="visual_content",
         metadata={"hnsw:space": "cosine"}
     )
     return True
+
+
+# Legacy alias
+def clear_database():
+    """Legacy alias for clear_visual_database()."""
+    return clear_visual_database()
 
 
 # =============================================================================
@@ -341,7 +381,7 @@ def index_video(
     Returns:
         int: Number of frames indexed
     """
-    collection = get_collection()
+    collection = get_visual_collection()
     
     # Stage 1: Extract frames
     if progress_callback:
@@ -373,8 +413,11 @@ def index_video(
     ids = [f"{video_id}_frame_{m['frame_idx']}" for m in metadata]
     
     for m in metadata:
+        m["type"] = "video"
         m["video_id"] = video_id
-        m["video_path"] = str(video_path)
+        m["source_id"] = video_id
+        m["source_path"] = str(video_path)
+        m["video_path"] = str(video_path)  # Legacy field
     
     collection.add(
         ids=ids,
@@ -388,9 +431,9 @@ def index_video(
     return len(frames)
 
 
-def search(query: str, model, processor, device, top_k: int = DEFAULT_TOP_K):
+def search_visual(query: str, model, processor, device, top_k: int = DEFAULT_TOP_K):
     """
-    Search for frames matching the text query.
+    Search for visual content (videos and images) matching the text query.
     
     Args:
         query: Natural language search query
@@ -400,9 +443,9 @@ def search(query: str, model, processor, device, top_k: int = DEFAULT_TOP_K):
         top_k: Number of results to return
     
     Returns:
-        list: List of result dicts with video_id, timestamp, score, etc.
+        list: List of result dicts with type, source_id, score, etc.
     """
-    collection = get_collection()
+    collection = get_visual_collection()
     
     if collection.count() == 0:
         return []
@@ -421,15 +464,33 @@ def search(query: str, model, processor, device, top_k: int = DEFAULT_TOP_K):
         distance = results["distances"][0][i]
         
         score = 1 - distance  # Convert distance to similarity
+        item_type = meta.get("type", "video")  # Default to video for legacy data
         
-        search_results.append({
+        result = {
             "rank": i + 1,
-            "video_id": meta["video_id"],
-            "video_path": meta.get("video_path", ""),
-            "timestamp": meta["timestamp"],
-            "timestamp_str": meta["timestamp_str"],
-            "frame_idx": meta["frame_idx"],
+            "type": item_type,
+            "source_id": meta.get("source_id") or meta.get("video_id", ""),
+            "source_path": meta.get("source_path") or meta.get("video_path", ""),
             "score": score,
-        })
+        }
+        
+        # Add type-specific fields
+        if item_type == "video":
+            result["video_id"] = meta.get("video_id", "")
+            result["video_path"] = meta.get("video_path", "")
+            result["timestamp"] = meta.get("timestamp", 0)
+            result["timestamp_str"] = meta.get("timestamp_str", "0:00:00")
+            result["frame_idx"] = meta.get("frame_idx", 0)
+        elif item_type == "image":
+            result["width"] = meta.get("width", 0)
+            result["height"] = meta.get("height", 0)
+        
+        search_results.append(result)
     
     return search_results
+
+
+# Legacy alias
+def search(query: str, model, processor, device, top_k: int = DEFAULT_TOP_K):
+    """Legacy alias for search_visual()."""
+    return search_visual(query, model, processor, device, top_k)
